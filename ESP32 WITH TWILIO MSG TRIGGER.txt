@@ -1,0 +1,239 @@
+eESP32 WITH TWILIO MSG TRIGGER
+
+
+
+#include <LiquidCrystal.h>
+LiquidCrystal lcd(4, 16, 17, 5, 18, 19); // RS, EN, D4, D5, D6, D7
+
+#include <Wire.h>
+#include <Adafruit_ADXL345_U.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <base64.h>
+#define BLYNK_TEMPLATE_ID "TMPL3TDqnDGRc"
+#define BLYNK_TEMPLATE_NAME "Machine Vibration Monitoring System"
+#include <BlynkSimpleEsp32.h>
+
+// Blynk auth and WiFi setup
+#define BLYNK_AUTH_TOKEN "EOCMoAhMfFblK0_R0HYFFPslcBnwe5z1"
+char auth[] = "EOCMoAhMfFblK0_R0HYFFPslcBnwe5z1";
+char ssid[] = "Iot";
+char pass[] = "iot12345";
+
+// Twilio details
+const char* account_sid = "ACa157490cac5d48e1041990a8b5f375db";
+const char* auth_token = "ffb70829cbc8cab4d89cc5470273dd2e";
+const char* from_number = "+17752541897"; // Twilio number
+const char* to_number = "+917548801510";  // Your phone
+
+Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
+
+float calibX = 0, calibY = 0, calibZ = 0;
+float upperVibrationLimit = 500.0; // Hz
+bool calibrated = false, smsSent = false;
+unsigned long exceedStartTime = 0;
+bool isExceeding = false;
+int alarmState = 0;
+
+void sendSMS(const char* body) {
+  WiFiClientSecure client;
+  client.setInsecure(); // For testing, disables CA cert check
+
+  if (!client.connect("api.twilio.com", 443)) {
+    Serial.println("Connection to Twilio failed");
+    return;
+  }
+  String auth = String(account_sid) + ":" + String(auth_token);
+  String encoded_auth = base64::encode(auth);
+  String post_data = "To=" + String(to_number) + "&From=" + String(from_number) + "&Body=" + String(body);
+  String request = "POST /2010-04-01/Accounts/" + String(account_sid) + "/Messages.json HTTP/1.1\r\n";
+  request += "Host: api.twilio.com\r\n";
+  request += "Authorization: Basic " + encoded_auth + "\r\n";
+  request += "Content-Type: application/x-www-form-urlencoded\r\n";
+  request += "Content-Length: " + String(post_data.length()) + "\r\n";
+  request += "Connection: close\r\n\r\n";
+  request += post_data;
+  client.print(request);
+
+  // Optionally print response for debugging:
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  String response = client.readString();
+  Serial.println(response);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+  lcd.begin(16, 2);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Machine Vibratn");
+  lcd.setCursor(0, 1);
+  lcd.print("Monitor System");
+  delay(3000);
+  lcd.clear();
+
+  if (!accel.begin()) {
+    lcd.setCursor(0, 0);
+    lcd.print("ADXL345 Error");
+    while (1) ;
+  }
+  accel.setRange(ADXL345_RANGE_16_G);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+  WiFi.begin(ssid, pass);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+  lcd.clear();
+  lcd.print("WiFi Connected");
+
+  Blynk.begin(auth, ssid, pass);
+
+  delay(1000);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Press Boot Btn");
+  lcd.setCursor(0, 1);
+  lcd.print("to Calibrate");
+}
+
+void loop() {
+  Blynk.run();
+
+  // Manual recalibration with BOOT button at any time
+  static bool lastBtnState = HIGH;
+  bool btnState = digitalRead(0); // BOOT_BUTTON GPIO0
+  if (lastBtnState == HIGH && btnState == LOW) {
+    calibrateAccelerometerAndSetAvgLimit();
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Re-Calib Done");
+    lcd.setCursor(0, 1);
+    lcd.print("Limit:");
+    lcd.print(upperVibrationLimit, 2);
+    delay(1000);
+    lcd.clear();
+    calibrated = true;
+  }
+  lastBtnState = btnState;
+
+  if (!calibrated) {
+    if (digitalRead(0) == LOW) {
+      calibrateAccelerometerAndSetAvgLimit();
+      calibrated = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Calib Done");
+      lcd.setCursor(0, 1);
+      lcd.print("Limit:");
+      lcd.print(upperVibrationLimit, 2);
+      delay(1000);
+      lcd.clear();
+    }
+    return;
+  }
+
+  sensors_event_t event;
+  accel.getEvent(&event);
+
+  int x_mg = int((event.acceleration.x / 9.81 - calibX) * 1000);
+  int y_mg = int((event.acceleration.y / 9.81 - calibY) * 1000);
+  int z_mg = int((event.acceleration.z / 9.81 - calibZ) * 1000);
+
+  float vibrationNorm = sqrt(pow(x_mg / 1000.0, 2) + pow(y_mg / 1000.0, 2) + pow(z_mg / 1000.0, 2));
+  float vibrationFreq = vibrationNorm * 100.0;
+
+  Blynk.virtualWrite(V0, x_mg);
+  Blynk.virtualWrite(V1, y_mg);
+  Blynk.virtualWrite(V2, z_mg);
+  Blynk.virtualWrite(V3, vibrationFreq);
+
+  Serial.print("X:"); Serial.print(x_mg);
+  Serial.print(" Y:"); Serial.print(y_mg);
+  Serial.print(" Z:"); Serial.print(z_mg);
+  Serial.print(" Vib:"); Serial.print(vibrationFreq);
+  Serial.print(" Limit:"); Serial.println(upperVibrationLimit);
+
+  lcd.setCursor(0, 0);
+  lcd.print("VIB:");
+  lcd.setCursor(4, 0);
+  lcd.print(vibrationFreq, 2);
+  lcd.print("Hz     ");
+
+  if (vibrationFreq > upperVibrationLimit) {
+    if (!isExceeding) {
+      exceedStartTime = millis();
+      isExceeding = true;
+    } else if ((millis() - exceedStartTime) >= 2000) {
+      lcd.setCursor(0, 1);
+      lcd.print("Vibration High ");
+      if (!smsSent) {
+        char message[100];
+        snprintf(message, sizeof(message), "MACHINE VIBRATION ALERT! Vib: %.2f Hz", vibrationFreq);
+        sendSMS(message);
+        smsSent = true;
+      }
+      Blynk.logEvent("high_vibration", String("VIB: ") + vibrationFreq);
+      alarmState = 1;
+    }
+  }
+  else {
+    lcd.setCursor(0, 1);
+    lcd.print("Vib Normal     ");
+    isExceeding = false;
+    smsSent = false;
+    alarmState = 0;
+  }
+  Blynk.virtualWrite(V4, alarmState);
+
+  delay(500);
+}
+
+void calibrateAccelerometerAndSetAvgLimit() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Calibrating...");
+  lcd.setCursor(0, 1);
+  lcd.print("Wait 10 seconds");
+
+  const unsigned long duration = 10000;
+  unsigned long start = millis();
+
+  float sumX = 0, sumY = 0, sumZ = 0;
+  float vibSum = 0;
+  int count = 0;
+  sensors_event_t event;
+
+  while (millis() - start < duration) {
+    accel.getEvent(&event);
+
+    float xg = event.acceleration.x / 9.81;
+    float yg = event.acceleration.y / 9.81;
+    float zg = event.acceleration.z / 9.81;
+
+    sumX += xg;
+    sumY += yg;
+    sumZ += zg;
+    count++;
+
+    float avgX = sumX / count;
+    float avgY = sumY / count;
+    float avgZ = sumZ / count;
+
+    float res = sqrt(pow(xg - avgX, 2) + pow(yg - avgY, 2) + pow(zg - avgZ, 2));
+    vibSum += res * 100.0;
+
+    delay(100);
+  }
+
+  calibX = sumX / count;
+  calibY = sumY / count;
+  calibZ = sumZ / count;
+  upperVibrationLimit = vibSum / count;
+}
